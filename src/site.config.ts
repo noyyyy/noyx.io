@@ -1,9 +1,9 @@
 const siteMeta = {
-	title: "Astro Theme Cactus",
-	description: "An opinionated starter theme for Astro",
-	lang: "en-GB",
-	ogLocale: "en_GB",
-	githubUrl: "https://github.com/chrismwilliams/astro-theme-cactus",
+	title: "NeverLand",
+	description: "Personal website of Noy",
+	lang: "en-SG",
+	ogLocale: "en-SG",
+	githubUrl: "https://github.com/noyyyy/noyx.io",
 	themeColorLight: "#fafafa",
 	themeColorDark: "#1d1f21",
 };
