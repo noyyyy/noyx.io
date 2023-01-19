@@ -1,0 +1,207 @@
+---
+title: "可预测的智能合约地址"
+publishDate: "19 Jan 2023"
+description: "在以太坊上进行交互时，总是会被各种看起来毫无规律的合约地址所烦恼，但实际上，这些地址，在智能合约产生前就是一件确定的事情了。"
+tags: ["solidity", "ethereum", "smart contract"]
+---
+
+以太坊上的账户分为两种，一类是外部账户（EOA），一类是合约账户（CA）。外部账户是由私钥来决定的，因此在不同的以太坊等效链上，相同的私钥可以掌管着相同的地址。而对于 CA 来说，其地址的产生方式是有特定的规则。在生产实践中，将合约部署到多链的时，总是会希望它拥有相同的地址。本文将总结以太坊上合约地址的产生方式以及现有的一些工具，并说明可能的应用场景。
+
+# 智能合约地址的产生
+
+默认情况下，当我们部署一个合约的时候，得到的地址跟我们当前地址和当前交易的 nonce 值相关，数值上等于
+
+```solidity
+bytes20(sha3(rlp.encode(address,nonce)))
+```
+
+## 通过 EOA 部署合约
+
+通过 EOA 部署合约是最常见的一件事情，首先根据上面的公式算出所生成的合约地址，作为 transaction 的 to 参数，再将编译出来的 bytecode 作为 transaction 的 data 参数，签名并且广播出去，就是一笔部署合约的 transaction。
+
+```json
+{
+	"to": <calculatedAddress>,
+	"value": <bytecode>,
+	"gasPrice": ...,
+	"gasLimit": ...
+}
+```
+
+## 通过合约部署合约
+
+通过合约来部署合约，常常见于工厂模式，只需要在合约里面 new 一个导入的合约，调用此方法时就会自动完成创建。
+
+在 [EIP-161](https://eips.ethereum.org/EIPS/eip-161) 之后，智能合约的 nonce 从 1 开始，且只有在创建合约的时候才会加 1。
+
+```solidity
+  function deployContract() external {
+    Contract addr = new Contract();
+  }
+```
+
+也可以直接通过 assembly 调用 create opcode 来创建
+
+```solidity
+  function deployContract() external {
+	bytes memory bytecode = type(Contract).creationCode;
+	address addr;
+    assembly {
+		addr := create(0, add(bytecode, 32), mload(bytecode))
+	}
+  }
+```
+
+上面两种办法的弊端是，工厂合约本身会非常大，因为子合约的全部字节码在工厂合约里了，部署工厂合约会花费特别多的 gas，一个比较好的替代办法是使用 [ERC1167](https://eips.ethereum.org/EIPS/eip-1167)，这里就不做过多赘述了。
+
+# Create2
+
+使用 address+nonce 的方法确实很美妙，几乎避免了重复的可能，但也涉及到了一个问题，在多个链上的部署的合约地址很难保持一致，因为保持 nonce 一致是很难的，除非使用一个专用的地址来部署。因此也出现了 create2，一个产生合约地址与 sender nonce 无关的 evm opcode。
+
+create2 得到的合约地址可以表述为以下
+
+```solidity
+bytes20(sha3(rlp.encode(address,bytecode,salt)))
+```
+
+由于 create2 是一个 opcode，因此只能通过合约部署合约的方式来实现。一个简单示例是：
+
+```solidity
+  function deployContractByCreate2() external {
+    bytes32 salt = bytes32(uint256(1));
+    Contract addr = new Contract{ salt: salt }();
+  }
+```
+
+也可以使用 assembly 直接调用 create2 opcode
+
+```solidity
+  function deployContractByCreate2Assembly() external {
+    address addr;
+    bytes memory bytecode = type(Contract).creationCode;
+    bytes32 salt = bytes32(uint256(1));
+    assembly {
+      addr := create2(0, add(bytecode, 32), mload(bytecode), salt)
+    }
+  }
+```
+
+上面的两个示例要求部署的子合约的 bytecode 在 factory 里面，这样大大限制了可部署合约的种类，因此，可以考虑直接将需要部署的合约的 bytecode 作为参数传入，成为一个相对通用的 create2factory
+
+```solidity
+  function deployCreate2(bytes memory bytecode, bytes32 salt) external {
+    address addr;
+    assembly {
+      addr := create2(0, add(bytecode, 32), mload(bytecode), salt)
+    }
+  }
+```
+
+[ERC2470 Singleton Factory](https://eips.ethereum.org/EIPS/eip-2470) 就是对这一种范式的总结，并给出一些官方的示例。
+
+## 公共 Create2 Factory
+
+这种通用的 create2 factory，很容易成为一种公共的基础设施，只要这个 factory 在不同的链上是一样的地址，那么只要使用相同的 bytecode 和 salt，就一定可以在不同的链上部署出同样的地址的合约。一个经典的例子是 [Deterministic deployment proxy](https://github.com/Arachnid/deterministic-deployment-proxy)，使用纯 Yul 写出高效的 deployer 合约。
+
+```solidity
+object "Proxy" {
+	// deployment code
+	code {
+		let size := datasize("runtime")
+		datacopy(0, dataoffset("runtime"), size)
+		return(0, size)
+	}
+	object "runtime" {
+		// deployed code
+		code {
+			calldatacopy(0, 32, sub(calldatasize(), 32))
+			let result := create2(callvalue(), 0, sub(calldatasize(), 32), calldataload(0))
+			if iszero(result) { revert(0, 0) }
+			mstore(0, result)
+			return(12, 20)
+		}
+	}
+}
+```
+
+在实际操作中，会遇到一个关键问题：要保证不同链上的 factory 的地址是相同的，如果这条链上没有 factory 地址，该如何操作？
+
+由于 Deterministic Deployment Proxy 出现在 [EIP-155](https://eips.ethereum.org/EIPS/eip-155) 之前，所以可以使用一个统一的无私钥的 transaction 在不同的链上发完全相同的交易，从而部署出相同的 factory 地址。
+
+现在，更多的是有一个中心化的个人/组织来控制一个确切的私钥，从而在不同的链上部署相同的 factory，例如 [safe-singleton-factory](https://github.com/safe-global/safe-singleton-factory)。
+
+## 部署带权限的合约
+
+很多时候，我们部署的合约带有一些权限管理，而 Openzepplin 的 Ownable，默认将 `msg.sender` 设置为 owner （[5.0 会优化](https://github.com/OpenZeppelin/openzeppelin-contracts/issues/2639)），直接继承 oz 的 Ownable 合约会将 owner 给到 factory，因此，这就需要将 owner 作为一个构造参数传入，例如：
+
+默认的 OZ Ownable
+
+```solidity
+    /**
+     * @dev Initializes the contract setting the deployer as the initial owner.
+     */
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+```
+
+将 owner 加入构造函数
+
+```solidity
+    /**
+     * @dev Initializes the contract with manual owner.
+     */
+    constructor(address owner_) {
+        _transferOwnership(owner_);
+    }
+```
+
+## Hardhat-deploy 集成
+
+hardhat-deploy 直接支持 [deterministic deployment](https://github.com/wighawag/hardhat-deploy#4-deterministicdeployment-ability-to-specify-a-deployment-factory)，在 `hardhat.config.ts` 里面配置特定链的 `factory` 地址，可以直接在 [safe-singleton-factory](https://github.com/safe-global/safe-singleton-factory) 找一个地址。然后在 `xxx_deploy_xxx.ts` 里指定 deterministicDeployment 的 salt 即可
+
+```typescript
+await deploy("MyContract", {
+	from: deployer,
+	log: true,
+	deterministicDeployment: keccak256(formatBytes32String("A salt")),
+});
+```
+
+# Create3
+
+Create3 是在 [EIP-3171](https://github.com/ethereum/eIPs/pull/3171) 中提出的一个新概念，主要是考虑到 bytecode 作为一个影响地址的变量本身太大，链上直接计算的成本较高。create3 希望创建的合约地址仅仅跟 sender 和 salt 有关。但由于这一目的可以通过 create + create2 本身实现，不是一个必要的 opcode，因此 EIP 最终没有通过。
+
+Sequence 的 [create3](https://github.com/0xsequence/create3) 应该是最早的一个实现了。实现需要两步：
+
+1. 在 factory 里面，使用 create2 方法创建一个 proxy 合约，这个合约的唯一功能就是部署另一个合约
+
+```solidity
+address proxy; assembly { proxy := create2(0, add(creationCode, 32), mload(creationCode), _salt)}
+```
+
+2. 调用刚刚部署的 proxy 合约来部署我们实际想要部署的合约
+
+```solidity
+(bool success,) = proxy.call(_creationCode);
+```
+
+proxy 是通过 create2 部署的，其地址仅仅跟 factory 的地址和 salt 有关，而实际的合约是通过 create 部署的，其地址仅仅跟 proxy 的地址和 proxy 的 nonce 有关。由于 proxy 是刚刚部署的，所以 proxy 的 nonce 是确定的为 1。因此，我们要部署的合约地址也就仅仅跟 factory 的地址和我们输入的 salt 有关了。也就是：
+
+```solidity
+bytes20(sha3(rlp.encode(bytes20(sha3(rlp.encode(address,proxy_bytecode,salt))),1)))
+```
+
+# 安全问题
+
+涉及到多链上相同的合约地址，一个必须要考虑的问题就是保证部署合约的排他性，不能随意的被别人抢占了地址。因此 create3 没有公共的 factory，自己部署 factory 也最好是设置一定的限制。而对于公共 create2 factory，也应该将全部的调用作为 salt 的一部分，从而传导影响到合约地址。
+
+# 应用场景
+
+当我们知道智能合约的产生的方式后，不仅可以在合约产生被部署之前知道地址，而且可以根据我们想要的方式去生成合约，最终可以完成以下一些目标：
+
+- 不需要读区块链，可以在其他地方直接计算出合约地址并进行相关操作，例如 The Graph 的 dataSource template。
+- 在不同的 ethereum 链上使用相同的合约地址，对多链 dapp 会比较友好，也能让多链智能合约钱包有更好的体验。
+- 预知智能合约的产生，可以在合约产生前做链上交互，例如把 ERC20 提前转进去。
+- 提前不停地调整 salt，从而生成带 “靓号” 的智能合约。
+- ...
