@@ -1,0 +1,78 @@
+---
+title: "MUD 敏捷开发: 分支管理和 CI/CD"
+publishDate: "10 Sep 2023"
+description: "在 MUD 出现之前，在 CI/CD 中加入对合约的管理感觉是一件非常麻烦的事情，有了 MUD，合约开发可以跟前端一样敏捷。"
+tags: ["MUD", "devops", "on-chain game", "solidity", "smart contract", "ethereum"]
+---
+
+一个好的 Devops 可以极大提高开开发者的体验，对于前端开发，这一点已经做到了极致，诸如 vercel 等 PaaS 平台层出不穷，对于后端而言，目前还是一个比较不太便捷的状态，因为创建多个新的数据库用于测试还是一件比较麻烦的事情。对于智能合约而言，曾经的我把它当作后端来看，因为合约的状态是持久化的，纵使有 tenderly 等可以直接 fork 的工具，和前端结合起来也会很麻烦。而现在，有了 MUD 框架的加持，它可以跟前端一样敏捷了。本文将探讨一下基于 MUD 开发分支管理和 CI/CD 的最佳实践，以开发 [Autochessia](https://github.com/HelheimLabs/autochessia) 作为例子。
+
+# 前 MUD 时代的局限
+
+我开始接触 solidity 时已经是 hardhat 的天下了，因此只谈论 hardhat 和 foundry。这两个框架用来开发合约都非常好用，但是部署合约却存在一些局限。
+
+hardhat 官方的教程推荐自己写 `script`， 然后指定网络来部署合约。简单部署一两个合约还好，对于部署很多合约的脚本，需要包括部署，互相 link 地址，以及设置其他的参数，一整个下来就是非常麻烦，不够结构化，需要写很多注释来提醒自己，并且没法放心的直接跑，需要每次跑之前重新看一遍。
+
+![](https://cdn.noyx.io/hardhat-tutorial.png)
+
+hardhat 有一个好用的部署插件，叫 [`hardhat-deploy`](https://github.com/wighawag/hardhat-deploy)，只需要写按照格式写入合约名字和参数，就可以自动部署并且将部署的地址保存，如下图所示。
+
+![](https://cdn.noyx.io/hardhat-deploy-saves.png)
+
+曾经的我一直使用这个，但用多了就会发现其局限性：支持的合约架构有限。
+
+也许是因为合约架构太多了，你可以写不可升级的，也可以写可升级的，可升级又可以选 transparent, uups, diamond，甚至一个 library 可以写成集成到内部和外部调用的。当你的架构足够复杂之后，使用 hardhat-deploy 写出来的部署脚本也会写的很丑陋。
+
+foundry 也有类似于 hardhat 的 script，但并没有类似于 `hardhat-deploy` 的插件，[给 forge 增加 `deploy` 的 issue](https://github.com/foundry-rs/foundry/issues/3911) 也一直没有推进。手动运行脚本部署然后手动把地址复制到 json 保存里对我来说是不可接受的，因此没有使用 foundry 部署过合约。
+
+![](https://cdn.noyx.io/forge-deploy.png)
+
+尽管这两个框架的部署功能没有很好用，但对于最主流应用的 Defi 来说，也许是够用的，因为 Defi 合约一般也部署不了几次。
+
+# MUD 带来的集成
+
+正如之前所说，尽管都是 solidity 写的代码，但是架构的可选性比较多，所以才导致了一个通用的开发工具没办法很好的做全套的部署管理。
+
+使用 MUD 的时候，你的合约框架就已经被限定了。MUD 定义了 `store`, `system`, `world` 等概念。`store` 是存储和逻辑分离，类似一个可升级的合约的结构，但实现逻辑又被拆解成多个 system 合约，单独部署，可以互相调用。整体跟 ERC2535 比较类似，也算是一种 Dynamic router 的方式，实现一个无限大的合约。
+
+在这样一套架构之下，MUD 做了合约的一键部署。只要按照规定的架构写代码，一行命令就能把合约部署好，并且根据你的 `postDeploy.sol` 完成配置。在这里，并不需要手动操作个合约的关联，因为逻辑合约会自动关联上。
+
+```bash
+pnpm run mud deploy --profile={network}
+```
+
+在 `postDeploy.sol` 里，变量配置也会很简洁，因为 MUD 对存储做的一层抽象，使得其操作起来就像操作传统数据库。
+
+除此之外，MUD 还把合约和前端放到同一个 monorepo 里，集成起来。部署完毕的合约地址会自动写到 json 里给前端使用，跟合约交互的 abi 会自动生成 ts function 供前端调用。手动复制 abi 的问题从此没有了。
+
+# 配置 autochessia 遇到的挑战
+
+autochessia 是一款全链游戏。游戏在开发过程中变化的可能性太多了，可能每天都改一些小东西。当厌倦了简洁的一行脚本部署的时候，就开始寻求自动化的方法。
+
+## 弃用 vercel 构建
+
+因为前端已经在用 vercel 部署了，所以会考虑直接用 vercel 来跑部署。但 vercel 的缺点在于构建环境太旧，vercel 使用的是 amazon linux 2，其 glibc 版本太低了，不能运行 foundry。
+
+那么解决办法就是不用 vercel 构建，采用 [vercel-action](https://github.com/amondnet/vercel-action)，转而使用 github action 来构建，仅用 vercel 作为部署，
+
+## 分支保护下的自动部署合约
+
+在目前的 mud 版本中，合约部署的的地址会写到一个 json 文件里，前端在构建的时候会引入这个 `json` 文件，因此，是否将部署好的地址添加到 git 里，这成了一个问题。
+
+![](https://cdn.noyx.io/mud-worlds.json.png)
+
+纠结了很久，最终达成了一个这样的分支管理的结果：
+
+有 main, develop, 和其他分支。main 和 develop 分支有分支保护规则，只能通过 pr 合并。
+
+- [main](https://github.com/HelheimLabs/autochessia/blob/develop/.github/workflows/vercel-prod.yaml) 分支是生产环境，收到代码推送后，会触发前端部署，而不部署合约。这也意味着生产环境的合约部署需要手动，但考虑到低频性，还可以接受。
+
+- [develop](https://github.com/HelheimLabs/autochessia/blob/develop/.github/workflows/deploy-dev.yaml) 是开发分支，所有的新功能和 bug 修复会先合并到此分支，但不会触发任何部署。会在夜间由 cron 触发一次夜间构建，自动部署合约和前端并且部署到 dev 环境。这里新部署的合约并不推送到 git，类似成一个临时的环境了，每天都是一个新的环境。
+
+- [其他分支](https://github.com/HelheimLabs/autochessia/blob/develop/.github/workflows/vercel-preview.yaml) 是写新代码随时创建的分支，这些分支会先 pr 到 develop 分支，在 pr 阶段，会触发自动构建，在新的代码上部署合约和前端，并且生成一个独一无二的预览链接。
+
+以上的三种分支的处理方法分别对应三个 action 文件，可以在 [github](https://github.com/HelheimLabs/autochessia/tree/develop/.github/workflows) 上找到。
+
+# 小结
+
+MUD 的出现确实给开发人员带来了更好的体验，让人爱不释手。虽然不确定将来合约开发的 devops 能到什么程度，是否会有类似 vercel 的平台出现，但目前自己 diy 的一套已经让人很舒服了，如果不够用后面会继续迭代。
